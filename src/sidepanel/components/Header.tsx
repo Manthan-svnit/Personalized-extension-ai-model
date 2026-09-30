@@ -4,12 +4,14 @@ import { RotateCw, Trash2, ShieldCheck, Sparkles } from 'lucide-react';
 interface HeaderProps {
   onRefreshContext: () => void;
   onClearChat: () => void;
+  onOpenDevInspector?: () => void;
   isRefreshing?: boolean;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onRefreshContext,
   onClearChat,
+  onOpenDevInspector,
   isRefreshing = false,
 }) => {
   return (
@@ -32,6 +34,17 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Minimal Action Buttons */}
       <div className="flex items-center gap-1">
+        {onOpenDevInspector && (
+          <button
+            onClick={onOpenDevInspector}
+            title="Developer / Admin Inspector (DOM & Vision)"
+            className="p-1.5 rounded-lg text-gemini-muted hover:text-gemini-blue hover:bg-gemini-surface active:scale-95 transition-all"
+            aria-label="Open Developer Inspector"
+          >
+            <ShieldCheck className="w-4 h-4" />
+          </button>
+        )}
+
         <button
           onClick={onRefreshContext}
           disabled={isRefreshing}

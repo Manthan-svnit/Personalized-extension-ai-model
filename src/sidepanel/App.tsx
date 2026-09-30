@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Header } from './components/Header';
 import { ChatThread } from './components/ChatThread';
 import { InputBox } from './components/InputBox';
+import { DevInspector } from './components/DevInspector';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ChatMessage, TabContext, ExtensionMessage } from '../types/extension';
 
 export const App: React.FC = () => {
@@ -9,6 +11,7 @@ export const App: React.FC = () => {
   const [tabContext, setTabContext] = useState<TabContext | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isDevInspectorOpen, setIsDevInspectorOpen] = useState(false);
 
   /**
    * Fetch context of the currently active tab
@@ -185,6 +188,7 @@ export const App: React.FC = () => {
       <Header
         onRefreshContext={fetchActiveTabContext}
         onClearChat={handleClearChat}
+        onOpenDevInspector={() => setIsDevInspectorOpen(true)}
         isRefreshing={isRefreshing}
       />
 
@@ -201,6 +205,14 @@ export const App: React.FC = () => {
         onSendMessage={handleSendMessage}
         disabled={isProcessing}
       />
+
+      {/* Developer / Admin Inspector Modal */}
+      <ErrorBoundary label="Developer Inspector" onReset={() => setIsDevInspectorOpen(false)}>
+        <DevInspector
+          isOpen={isDevInspectorOpen}
+          onClose={() => setIsDevInspectorOpen(false)}
+        />
+      </ErrorBoundary>
     </div>
   );
 };

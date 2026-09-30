@@ -1,4 +1,15 @@
-import { ExtensionMessage, TabContext, ScreenAndDomPayload } from '../types/extension';
+import { 
+  ExtensionMessage, 
+  TabContext, 
+  ScreenAndDomPayload, 
+  VisionDetection,
+  VisionMeta,
+  DetectedPII,
+  ExtractedOCRToken,
+  ExtractedOCRLine,
+  OCRMeta,
+  DetectionOverlayPayload
+} from '../types/extension';
 
 const OFFSCREEN_DOCUMENT_PATH = 'src/offscreen/offscreen.html';
 let creatingOffscreenPromise: Promise<void> | null = null;
@@ -314,16 +325,100 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
             return;
           }
 
-          const { elements, viewport } = domResponse.payload;
+          const { elements, viewport, staticTextNodes } = domResponse.payload;
 
-          sendResponse({
-            success: true,
-            payload: {
-              screenshotUrl,
-              elements,
-              viewport
+          // Forward screenshot to offscreen document for vision inference and OCR + PII
+          // scanning concurrently.
+          let visionDetections: VisionDetection[] = [];
+          let visionMeta: VisionMeta | undefined;
+          let piiDetections: DetectedPII[] = [];
+          let ocrTokens: ExtractedOCRToken[] = [];
+          let ocrLines: ExtractedOCRLine[] = [];
+          let ocrMeta: OCRMeta | undefined;
+          let piiMeta: ScreenAndDomPayload['piiMeta'];
+
+          try {
+            await ensureOffscreenDocument();
+
+            const [visionResponse, piiResponse] = await Promise.all([
+              chrome.runtime.sendMessage({
+                type: 'OFFSCREEN_RUN_VISION',
+                payload: { screenshotUrl, viewport, extractedElements: elements },
+                sender: 'background'
+              } as ExtensionMessage).catch(err => {
+                console.warn('[Keyboard Warriors] Vision dispatch error:', err);
+                return null;
+              }),
+              chrome.runtime.sendMessage({
+                type: 'OFFSCREEN_SCAN_PII',
+                payload: { screenshotUrl, domElements: elements, staticTextNodes, viewport },
+                sender: 'background'
+              } as ExtensionMessage).catch(err => {
+                console.warn('[Keyboard Warriors] PII dispatch error:', err);
+                return null;
+              })
+            ]);
+
+            if (visionResponse?.success && visionResponse?.payload) {
+              visionDetections = visionResponse.payload.detections || [];
+              visionMeta = {
+                modelsUsed: visionResponse.payload.modelsUsed || [],
+                processingTimeMs: visionResponse.payload.processingTimeMs || 0,
+                statuses: visionResponse.payload.statuses || [],
+                faceCount: visionResponse.payload.faceCount ?? 0,
+                objectCount: visionResponse.payload.objectCount ?? 0,
+              };
+            } else {
+              // A dead vision stage must say so; an empty box list reads as "nothing found".
+              visionMeta = {
+                modelsUsed: [],
+                processingTimeMs: 0,
+                statuses: [],
+                faceCount: 0,
+                objectCount: 0,
+                error: visionResponse?.error || 'The vision stage did not return a result.',
+              };
+              console.warn('[Keyboard Warriors] Vision stage failed:', visionMeta.error);
             }
-          });
+
+            if (piiResponse?.success && piiResponse?.payload) {
+              piiDetections = piiResponse.payload.piiDetections || [];
+              ocrTokens = piiResponse.payload.ocrTokens || [];
+              ocrLines = piiResponse.payload.ocrLines || [];
+              ocrMeta = piiResponse.payload.ocrMeta;
+              piiMeta = piiResponse.payload.piiMeta;
+            } else {
+              ocrMeta = piiResponse?.payload?.ocrMeta;
+              piiMeta = {
+                totalScanned: 0,
+                flaggedCount: 0,
+                processingTimeMs: 0,
+                error: piiResponse?.error || 'The OCR/PII stage did not return a result.',
+              };
+              console.warn('[Keyboard Warriors] PII stage failed:', piiMeta.error);
+            }
+          } catch (offscreenErr: any) {
+            const message = offscreenErr?.message || String(offscreenErr);
+            console.warn('[Keyboard Warriors] Offscreen processing skipped:', message);
+            visionMeta = { modelsUsed: [], processingTimeMs: 0, statuses: [], error: message };
+            piiMeta = { totalScanned: 0, flaggedCount: 0, processingTimeMs: 0, error: message };
+          }
+
+          const payload: ScreenAndDomPayload = {
+            screenshotUrl,
+            elements,
+            staticTextNodes: staticTextNodes || [],
+            viewport,
+            visionDetections,
+            visionMeta,
+            ocrTokens,
+            ocrLines,
+            ocrMeta,
+            piiDetections,
+            piiMeta
+          };
+
+          sendResponse({ success: true, payload });
         } catch (error: any) {
           console.error('[Keyboard Warriors] GET_SCREEN_AND_DOM error:', error);
           sendResponse({
@@ -369,6 +464,54 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           sendResponse({
             success: false,
             error: 'Offscreen worker execution failed: ' + String(err)
+          });
+        }
+      })();
+      return true;
+    }
+
+    case 'SCAN_PII': {
+      (async () => {
+        try {
+          await ensureOffscreenDocument();
+          // Re-dispatched under a distinct type so the offscreen listener is the only
+          // handler of this request and therefore the only possible responder.
+          const piiResponse = await chrome.runtime.sendMessage({
+            type: 'OFFSCREEN_SCAN_PII',
+            payload: message.payload,
+            sender: 'background'
+          } as ExtensionMessage);
+          sendResponse(piiResponse);
+        } catch (err: any) {
+          console.error('[Keyboard Warriors] SCAN_PII background routing failed:', err);
+          sendResponse({ success: false, error: err?.message || String(err) });
+        }
+      })();
+      return true;
+    }
+
+    case 'RENDER_DETECTION_OVERLAY':
+    case 'CLEAR_DETECTION_OVERLAY': {
+      (async () => {
+        try {
+          const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          if (!activeTab?.id || !isValidWebUrl(activeTab.url)) {
+            sendResponse({ success: false, error: 'No inspectable web page is active.' });
+            return;
+          }
+
+          const target: ExtensionMessage =
+            messageType === 'RENDER_DETECTION_OVERLAY'
+              ? { type: 'RENDER_DETECTION_OVERLAY', payload: message.payload as DetectionOverlayPayload }
+              : { type: 'CLEAR_DETECTION_OVERLAY' };
+
+          const response = await chrome.tabs.sendMessage(activeTab.id, target);
+          sendResponse(response ?? { success: true });
+        } catch (err: any) {
+          // A missing content script is a normal state on a tab that predates the install.
+          sendResponse({
+            success: false,
+            error: 'Content script unavailable — refresh the page, then run the pipeline again.'
           });
         }
       })();
